@@ -1,0 +1,96 @@
+{
+    "benchmark_results": {
+        "Random Forest": {
+            "Test Accuracy": 99.4,
+            "CV Mean Accuracy": 96.84,
+            "CV Std": 0.79,
+            "Weighted Precision": 99.4,
+            "Weighted Recall": 99.4,
+            "Weighted F1-Score": 99.4
+        },
+        "Gradient Boosting": {
+            "Test Accuracy": 99.4,
+            "CV Mean Accuracy": 96.77,
+            "CV Std": 0.84,
+            "Weighted Precision": 99.4,
+            "Weighted Recall": 99.4,
+            "Weighted F1-Score": 99.4
+        },
+        "Support Vector Machine (SVC)": {
+            "Test Accuracy": 98.35,
+            "CV Mean Accuracy": 96.43,
+            "CV Std": 0.76,
+            "Weighted Precision": 98.35,
+            "Weighted Recall": 98.35,
+            "Weighted F1-Score": 98.35
+        },
+        "Multi-Layer Perceptron (Neural Net)": {
+            "Test Accuracy": 99.4,
+            "CV Mean Accuracy": 97.03,
+            "CV Std": 0.67,
+            "Weighted Precision": 99.41,
+            "Weighted Recall": 99.4,
+            "Weighted F1-Score": 99.4
+        }
+    },
+    "best_hyperparameters": {
+        "criterion": "entropy",
+        "max_depth": 15,
+        "min_samples_split": 2,
+        "n_estimators": 100
+    },
+    "final_accuracy": 99.25,
+    "evaluation_type": "held-out test split",
+    "classes": [
+        "deadlift",
+        "plank",
+        "pull up",
+        "push up",
+        "squat"
+    ],
+    "classification_report": {
+        "deadlift": {
+            "precision": 1.0,
+            "recall": 0.98,
+            "f1-score": 0.98989898989899,
+            "support": 100.0
+        },
+        "plank": {
+            "precision": 0.9949748743718593,
+            "recall": 1.0,
+            "f1-score": 0.9974811083123426,
+            "support": 198.0
+        },
+        "pull up": {
+            "precision": 1.0,
+            "recall": 0.9821428571428571,
+            "f1-score": 0.990990990990991,
+            "support": 112.0
+        },
+        "push up": {
+            "precision": 0.9821428571428571,
+            "recall": 0.990990990990991,
+            "f1-score": 0.9865470852017937,
+            "support": 111.0
+        },
+        "squat": {
+            "precision": 0.9863945578231292,
+            "recall": 1.0,
+            "f1-score": 0.9931506849315068,
+            "support": 145.0
+        },
+        "accuracy": 0.9924924924924925,
+        "macro avg": {
+            "precision": 0.9927024578675692,
+            "recall": 0.9906267696267698,
+            "f1-score": 0.9916137718671247,
+            "support": 666.0
+        },
+        "weighted avg": {
+            "precision": 0.9925677074366951,
+            "recall": 0.9924924924924925,
+            "f1-score": 0.9924860738726747,
+            "support": 666.0
+        }
+    }
+}

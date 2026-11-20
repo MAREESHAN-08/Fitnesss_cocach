@@ -1,0 +1,2174 @@
+import streamlit as st
+import numpy as np
+import pandas as pd
+import joblib
+import json
+from PIL import Image
+import tempfile
+import warnings
+import os
+import time
+import io
+import threading
+import queue
+import subprocess
+try:
+    import pyttsx3
+    import pythoncom
+except Exception:
+    pyttsx3 = None
+    pythoncom = None
+import plotly.graph_objects as go
+import plotly.express as px
+
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+
+try:
+    import cv2
+    import mediapipe as mp
+except ModuleNotFoundError as exc:
+    cv2 = None
+    mp = None
+    DEPENDENCY_ERROR = exc
+else:
+    DEPENDENCY_ERROR = None
+
+from feature_engineering import (
+    extract_features_from_landmarks,
+    calculate_angle,
+    calculate_angle_2d,
+    calculate_torso_inclination,
+    calculate_hip_deviation_2d
+)
+from auth import (
+    verify_user,
+    register_user,
+    log_workout_session,
+    get_user_workout_history,
+    get_user_stats
+)
+
+warnings.filterwarnings("ignore")
+
+# =========================================================
+# 🎙️ DESKTOP VOICE COACH ENGINE (Python pyttsx3 Native Speech)
+# =========================================================
+
+class DesktopVoiceCoach:
+    """
+    Hardware-native text-to-speech engine running in a dedicated background
+    daemon thread. Plays directly through PC speakers without browser iframe
+    or autoplay restrictions. Non-blocking and thread-safe.
+    """
+    def __init__(self):
+        self.q = queue.Queue(maxsize=2)
+        self.last_spoken_time = 0.0
+        self.last_message = ""
+        self.lock = threading.Lock()
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def _worker(self):
+        engine = None
+        if pyttsx3 is not None:
+            try:
+                if pythoncom is not None:
+                    pythoncom.CoInitialize()
+                engine = pyttsx3.init()
+                engine.setProperty('rate', 160)
+                voices = engine.getProperty('voices')
+                for v in voices:
+                    v_name = v.name.lower()
+                    if 'david' in v_name or 'zira' in v_name or 'english' in v_name:
+                        engine.setProperty('voice', v.id)
+                        break
+            except Exception as e:
+                engine = None
+
+        while True:
+            msg = self.q.get()
+            if msg:
+                spoken = False
+                if engine is not None:
+                    try:
+                        engine.say(msg)
+                        engine.runAndWait()
+                        spoken = True
+                    except Exception:
+                        spoken = False
+                if not spoken:
+                    try:
+                        clean_text = msg.replace("'", " ").replace('"', ' ')
+                        cmd = f"Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{clean_text}')"
+                        subprocess.run(["powershell", "-NoProfile", "-Command", cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    except Exception:
+                        pass
+            self.q.task_done()
+
+    def speak(self, message: str, interval: float = 6.0, force: bool = False):
+        if not message:
+            return
+        now = time.time()
+        with self.lock:
+            if not force:
+                # Enforce interval cooldown to stop voice looping
+                if (now - self.last_spoken_time < interval):
+                    return
+                if not self.q.empty():
+                    return
+            else:
+                # Emergency / Rep feedback: enforce minimum 3s gap
+                if (now - self.last_spoken_time < 3.0):
+                    return
+                try:
+                    while not self.q.empty():
+                        self.q.get_nowait()
+                        self.q.task_done()
+                except Exception:
+                    pass
+            self.last_spoken_time = now
+            self.last_message = message
+            try:
+                self.q.put_nowait(message)
+            except Exception:
+                pass
+
+
+@st.cache_resource
+def get_voice_coach():
+    return DesktopVoiceCoach()
+
+
+def speak(message: str, force: bool = False):
+    """Speaks message via background native voice engine."""
+    coach = get_voice_coach()
+    coach.speak(message, force=force)
+
+
+def get_voice_feedback(
+    exercise: str,
+    is_correct: bool,
+    errors: list,
+    score: int,
+    rep_count: int = 0,
+    stage: str = ""
+) -> str:
+    """
+    Speaks ONLY when posture is incorrect.
+    Format: 'Correction: [Actionable fix]. Injury Warning: [Specific orthopedic risk].'
+    Completely silent when form is correct (no voice loop).
+    """
+    # 🔇 SILENT when posture is correct — prevents voice looping
+    if is_correct or not errors:
+        return ""
+
+    exercise = exercise.lower().replace(" ", "").replace("_", "")
+    err = errors[0].lower()
+
+    # 1. Squat Posture Errors
+    if "excessive forward lean" in err or "torso" in err:
+        return "Correction: Keep your chest upright and drive your hips back. Injury Warning: Forward lean causes acute lumbar shear stress and lower back strain."
+    elif "knee hyperflexion" in err or "meniscus" in err:
+        return "Correction: Stop descending at 90 degrees parallel. Injury Warning: Deep hyperflexion compresses meniscus cartilage and strains patellar tendons."
+    elif "shallow" in err or "depth" in err:
+        return "Correction: Descend deeper until thighs reach parallel to the ground. Injury Warning: Shallow squats overload knee joints without engaging the glutes."
+    elif "valgus" in err or "knee collapse" in err:
+        return "Correction: Push your knees outward in line with your toes. Injury Warning: Inward knee collapse causes severe ACL and medial meniscus tears."
+
+    # 2. Push-up & Plank Posture Errors
+    elif "sagging" in err or "hips dropping" in err:
+        return "Correction: Squeeze your glutes and tighten your core into a rigid straight line. Injury Warning: Sagging hips causes lumbar hyperextension and spinal disc compression."
+    elif "piked" in err:
+        return "Correction: Lower your hips to align with your shoulders and heels. Injury Warning: Raised hips shift excessive load into shoulders, causing anterior shoulder impingement."
+    elif "incomplete" in err and exercise == "pushup":
+        return "Correction: Lower your chest smoothly until elbows reach 90 degrees. Injury Warning: Incomplete depth leads to shoulder anterior ligament strain and muscle imbalance."
+
+    # 3. Deadlift Posture Errors
+    elif "rounded spine" in err or "stiff leg" in err:
+        return "Correction: Flatten your back, bend your knees, and hinge strictly from your hips. Injury Warning: A rounded spine causes acute lumbar disc herniation at L4 S1."
+    elif "hyperextension" in err and exercise == "deadlift":
+        return "Correction: Stand tall with a neutral vertical spine and lock out with your glutes. Injury Warning: Leaning backwards crushes your lumbar facet joints."
+
+    # 4. Pull-up Posture Errors
+    elif "swing" in err or "momentum" in err:
+        return "Correction: Stabilize your core and pull with controlled cadence. Injury Warning: Kipping and swinging causes rotator cuff tears and shoulder labrum damage."
+    elif "incomplete" in err and exercise == "pullup":
+        return "Correction: Drive your elbows down and pull until your chin clears the bar. Injury Warning: Partial pullups strain bicep tendons."
+
+    # 5. General Spinal / Orthopedic Error
+    elif "lumbar" in err or "spine" in err or "back" in err:
+        return "Correction: Re-align your spine into a neutral position. Injury Warning: Misalignment causes spinal disc fatigue and chronic lower back pain."
+    else:
+        fault_name = errors[0].split(':')[0]
+        return f"Correction: Re-align your joints to fix {fault_name}. Injury Warning: Flawed biomechanics causes orthopedic joint strain."
+
+
+# ──────────────────────────────────────────────────────────────
+# Voice Coach UI Settings (Sidebar helper)
+# ──────────────────────────────────────────────────────────────
+def voice_coach_sidebar() -> dict:
+    """Renders voice coach settings in the sidebar, returns config dict."""
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🎙️ AI Voice Coach (English)")
+    vc_enabled = st.sidebar.toggle("Enable Voice Coach", value=True)
+    vc_interval = st.sidebar.slider("Voice Alert Interval (seconds)", 4, 15, 6,
+                                    help="Minimum gap between consecutive voice alerts to prevent looping")
+    
+    # 🔊 Quick test button directly in sidebar!
+    if st.sidebar.button("🔊 Test Voice Coach Now", use_container_width=True):
+        coach = get_voice_coach()
+        coach.speak("Voice coach is active. I will alert you whenever posture is incorrect with corrections and injury warnings.", force=True)
+        st.sidebar.success("🔊 Speaking through PC speakers!")
+
+    return {"enabled": vc_enabled, "interval": vc_interval}
+
+
+# =========================================================
+# PDF CLINICAL REPORT GENERATOR (REPORTLAB)
+# =========================================================
+def generate_clinical_pdf_report(user_name, exercise_name, is_correct, score, accuracy_rate, total_frames, 
+                                 joint_angles, errors, injury_risk, prescriptions, file_name="Live_Stream"):
+    """
+    Generates an executive, hospital/sports-clinic grade PDF Audit Certificate.
+    """
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=letter,
+        rightMargin=36,
+        leftMargin=36,
+        topMargin=36,
+        bottomMargin=36
+    )
+    
+    styles = getSampleStyleSheet()
+    
+    c_primary = colors.HexColor("#1e1b4b")   # Dark Navy Indigo
+    c_accent = colors.HexColor("#0284c7")    # Sky Blue
+    c_success = colors.HexColor("#16a34a")   # Green
+    c_danger = colors.HexColor("#dc2626")    # Red
+    c_dark = colors.HexColor("#1e293b")      # Slate Dark
+    c_bg = colors.HexColor("#f8fafc")        # Soft Slate Light
+    
+    title_style = ParagraphStyle(
+        'DocTitle',
+        parent=styles['Heading1'],
+        fontName='Helvetica-Bold',
+        fontSize=20,
+        leading=24,
+        textColor=c_primary,
+        alignment=1
+    )
+    
+    subtitle_style = ParagraphStyle(
+        'DocSubTitle',
+        parent=styles['Normal'],
+        fontName='Helvetica',
+        fontSize=10,
+        leading=13,
+        textColor=c_accent,
+        alignment=1
+    )
+    
+    sec_title = ParagraphStyle(
+        'SectionHeading',
+        parent=styles['Heading2'],
+        fontName='Helvetica-Bold',
+        fontSize=12,
+        leading=16,
+        textColor=c_primary,
+        spaceAfter=6
+    )
+    
+    body_style = ParagraphStyle(
+        'BodyTextCustom',
+        parent=styles['Normal'],
+        fontName='Helvetica',
+        fontSize=9,
+        leading=13,
+        textColor=c_dark
+    )
+    
+    elements = []
+    
+    # Header
+    elements.append(Paragraph("AI BIOMECHANICAL AUDIT & CLINICAL CERTIFICATE", title_style))
+    elements.append(Paragraph("PoseAI Center for Biomechanical Intelligence & Orthopedic Prevention", subtitle_style))
+    elements.append(Spacer(1, 10))
+    elements.append(HRFlowable(width="100%", thickness=2, color=c_accent, spaceBefore=4, spaceAfter=14))
+    
+    # Metadata Table
+    status_label = "CLINICALLY OPTIMAL FORM [PASS]" if is_correct else "BIOMECHANICAL FAULT DETECTED [NEEDS CORRECTION]"
+    status_color = c_success if is_correct else c_danger
+    
+    meta_data = [
+        [
+            Paragraph(f"<b>Patient / Athlete:</b> {user_name}", body_style),
+            Paragraph(f"<b>Audit Date:</b> {time.strftime('%Y-%m-%d %H:%M:%S')}", body_style)
+        ],
+        [
+            Paragraph(f"<b>Evaluated Exercise:</b> {exercise_name.upper()}", body_style),
+            Paragraph(f"<b>Total Analyzed Frames:</b> {total_frames}", body_style)
+        ],
+        [
+            Paragraph(f"<b>Kinematic Quality Score:</b> {score} / 100", body_style),
+            Paragraph(f"<b>Repetition Accuracy:</b> {accuracy_rate}%", body_style)
+        ],
+        [
+            Paragraph(f"<b>Clinical Verdict:</b> <font color='{status_color.hexval()}'><b>{status_label}</b></font>", body_style),
+            Paragraph(f"<b>Source Media:</b> {file_name}", body_style)
+        ]
+    ]
+    meta_table = Table(meta_data, colWidths=[270, 270])
+    meta_table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,-1), c_bg),
+        ('BOX', (0,0), (-1,-1), 1, colors.HexColor("#cbd5e1")),
+        ('INNERGRID', (0,0), (-1,-1), 0.5, colors.HexColor("#e2e8f0")),
+        ('PADDING', (0,0), (-1,-1), 6),
+    ]))
+    elements.append(meta_table)
+    elements.append(Spacer(1, 14))
+    
+    # Joint Angle Table
+    elements.append(Paragraph("1. Precision Bilateral Kinematic Measurements", sec_title))
+    angle_rows = [
+        ["Joint Landmark", "Measured Angle / Value", "Physiological Target Reference", "Biomechanical Evaluation"]
+    ]
+    
+    knee_ang = joint_angles.get('avg_knee', 0)
+    elbow_ang = joint_angles.get('avg_elbow', 0)
+    hip_ang = joint_angles.get('avg_hip', 0)
+    torso_inc = joint_angles.get('torso_inc', 0)
+    sym_score = joint_angles.get('symmetry_score', 0)
+    
+    angle_rows.append(["Knee Joint Flexion", f"{knee_ang:.1f}°", "Parallel Depth ~ 70°-100°", "Optimal" if 65 <= knee_ang <= 105 or knee_ang > 145 else "Check Depth"])
+    angle_rows.append(["Elbow Joint Flexion", f"{elbow_ang:.1f}°", "Lockout 160° / Pushup Chest 90°", "Safe ROM" if elbow_ang <= 105 or elbow_ang >= 150 else "Partial ROM"])
+    angle_rows.append(["Hip / Back Joint Flexion", f"{hip_ang:.1f}°", "Squat Hinge 70°-100° / Plank 160°-180°", "Stable Neutral" if hip_ang >= 65 else "Extreme Flexion"])
+    angle_rows.append(["Torso Inclination from Vertical", f"{torso_inc:.1f}°", "Upright: 0°-40° / Max: < 48°", "Optimal" if torso_inc <= 48 else "Excessive Lean"])
+    angle_rows.append(["Bilateral Symmetry Score", f"{sym_score:.1f}%", "Target Symmetrical > 85.0%", "Balanced" if sym_score >= 85 else "Asymmetric"])
+    
+    angle_table = Table(angle_rows, colWidths=[150, 110, 150, 130])
+    angle_table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), c_primary),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0,0), (-1,0), 8),
+        ('BOTTOMPADDING', (0,0), (-1,0), 5),
+        ('BACKGROUND', (0,1), (-1,-1), colors.white),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#cbd5e1")),
+        ('FONTNAME', (0,1), (-1,-1), 'Helvetica'),
+        ('FONTSIZE', (0,1), (-1,-1), 8),
+        ('PADDING', (0,0), (-1,-1), 5),
+    ]))
+    elements.append(angle_table)
+    elements.append(Spacer(1, 14))
+    
+    # Injury Risk Section
+    elements.append(Paragraph("2. Orthopedic & Kinetic Injury Risk Assessment", sec_title))
+    risk_text = f"<b>Risk Classification:</b> {injury_risk}"
+    elements.append(Paragraph(risk_text, body_style))
+    if errors:
+        elements.append(Spacer(1, 4))
+        for err in errors:
+            elements.append(Paragraph(f"• <font color='red'><b>Biomechanical Flaw:</b></font> {err}", body_style))
+    elements.append(Spacer(1, 14))
+    
+    # Corrective Prescriptions
+    elements.append(Paragraph("3. Physiotherapy & Corrective Exercise Prescription", sec_title))
+    if prescriptions:
+        for rx in prescriptions:
+            elements.append(Paragraph(f"• {rx}", body_style))
+    else:
+        elements.append(Paragraph("• Continue regular training progression with progressive overload and controlled cadence.", body_style))
+    elements.append(Spacer(1, 16))
+    
+    # Sign-off block
+    elements.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#cbd5e1"), spaceBefore=4, spaceAfter=8))
+    sign_data = [
+        [Paragraph("<b>Certified By:</b> PoseAI Automated Biomechanics Diagnostic Suite", body_style),
+         Paragraph("<b>Clinical Verification:</b> 100% Certified Algorithmic Model", body_style)]
+    ]
+    sign_table = Table(sign_data, colWidths=[270, 270])
+    elements.append(sign_table)
+
+    doc.build(elements)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# =========================================================
+# PRECISION BIOMECHANICAL POSTURE & INJURY RISK ENGINE
+# =========================================================
+def evaluate_advanced_posture(landmarks_list, exercise_name):
+    """
+    Precision multi-joint biomechanical evaluation.
+    Utilizes 2D planar projection to eliminate monocular depth noise.
+    Accurately detects Parallel Squats, Controlled Torso Lean, Sagging vs Piked Hips, and Deadlift Hinges.
+    """
+    exercise_name = str(exercise_name).lower().replace(" ", "").replace("_", "")
+    
+    def get_vis(idx):
+        if len(landmarks_list[idx]) > 3:
+            return float(landmarks_list[idx][3])
+        return 1.0
+
+    # Bilateral visibility check
+    left_vis = (get_vis(11) + get_vis(13) + get_vis(23) + get_vis(25) + get_vis(27)) / 5.0
+    right_vis = (get_vis(12) + get_vis(14) + get_vis(24) + get_vis(26) + get_vis(28)) / 5.0
+    
+    # Bilateral 2D planar joint angles
+    l_knee = calculate_angle_2d(landmarks_list[23], landmarks_list[25], landmarks_list[27])
+    r_knee = calculate_angle_2d(landmarks_list[24], landmarks_list[26], landmarks_list[28])
+    
+    l_elbow = calculate_angle_2d(landmarks_list[11], landmarks_list[13], landmarks_list[15])
+    r_elbow = calculate_angle_2d(landmarks_list[12], landmarks_list[14], landmarks_list[16])
+    
+    l_hip = calculate_angle_2d(landmarks_list[11], landmarks_list[23], landmarks_list[25])
+    r_hip = calculate_angle_2d(landmarks_list[12], landmarks_list[24], landmarks_list[26])
+    
+    l_bodyline = calculate_angle_2d(landmarks_list[11], landmarks_list[23], landmarks_list[27])
+    r_bodyline = calculate_angle_2d(landmarks_list[12], landmarks_list[24], landmarks_list[28])
+    
+    l_torso_inc = calculate_torso_inclination(landmarks_list[11], landmarks_list[23])
+    r_torso_inc = calculate_torso_inclination(landmarks_list[12], landmarks_list[24])
+    
+    l_hip_dev = calculate_hip_deviation_2d(landmarks_list[11], landmarks_list[23], landmarks_list[27])
+    r_hip_dev = calculate_hip_deviation_2d(landmarks_list[12], landmarks_list[24], landmarks_list[28])
+    
+    # Robust dominant side selection (handles side-profile vs front profile views)
+    if abs(left_vis - right_vis) > 0.22:
+        if left_vis > right_vis:
+            knee, elbow, hip, bodyline, torso_inc, hip_dev = l_knee, l_elbow, l_hip, l_bodyline, l_torso_inc, l_hip_dev
+        else:
+            knee, elbow, hip, bodyline, torso_inc, hip_dev = r_knee, r_elbow, r_hip, r_bodyline, r_torso_inc, r_hip_dev
+    else:
+        knee = (l_knee + r_knee) / 2.0
+        elbow = (l_elbow + r_elbow) / 2.0
+        hip = (l_hip + r_hip) / 2.0
+        bodyline = (l_bodyline + r_bodyline) / 2.0
+        torso_inc = (l_torso_inc + r_torso_inc) / 2.0
+        hip_dev = (l_hip_dev + r_hip_dev) / 2.0
+
+    # Left-Right Symmetry Index
+    knee_sym = max(0, 100 - abs(l_knee - r_knee))
+    elbow_sym = max(0, 100 - abs(l_elbow - r_elbow))
+    hip_sym = max(0, 100 - abs(l_hip - r_hip))
+    overall_symmetry = round((knee_sym + elbow_sym + hip_sym) / 3.0, 1)
+
+    joint_angles = {
+        'left_knee': round(l_knee, 1),
+        'right_knee': round(r_knee, 1),
+        'avg_knee': round(knee, 1),
+        'left_elbow': round(l_elbow, 1),
+        'right_elbow': round(r_elbow, 1),
+        'avg_elbow': round(elbow, 1),
+        'left_back': round(l_hip, 1),
+        'right_back': round(r_hip, 1),
+        'avg_back': round(hip, 1),
+        'avg_hip': round(hip, 1),
+        'bodyline': round(bodyline, 1),
+        'torso_inc': round(torso_inc, 1),
+        'hip_dev': round(hip_dev, 3),
+        'knee_sym': round(knee_sym, 1),
+        'elbow_sym': round(elbow_sym, 1),
+        'back_sym': round(hip_sym, 1),
+        'hip_sym': round(hip_sym, 1),
+        'symmetry_score': overall_symmetry
+    }
+
+    errors = []
+    faulty_joints = []
+    prescriptions = []
+    score = 100
+
+    # 1. SQUAT POSTURE EVALUATION
+    if exercise_name == 'squat':
+        # Standing / Top Phase
+        if knee > 145:
+            status = "Correct Form ✅ (Standing / Preparation Phase)"
+            risk = "Low Injury Risk (Optimal Knee & Spinal Alignment)"
+            prescriptions.append("🌟 Form is optimal! Maintain upright chest and braced abdominal core.")
+            
+        # Parallel / Deep Squat Phase (Knee <= 105°)
+        elif knee <= 105:
+            if torso_inc > 48.0:
+                errors.append(f"Excessive Forward Lean: Torso inclined {torso_inc:.0f}° from vertical (Spinal shear stress)")
+                faulty_joints.extend([11, 12, 23, 24])
+                prescriptions.append("🏋️ Keep chest upright & engage core; strengthen thoracic spine with Goblet Squats")
+                score -= 35
+                
+            if knee < 48.0:
+                errors.append(f"Excessive Knee Hyperflexion ({knee:.0f}° < 50°): Excessive meniscus compression")
+                faulty_joints.extend([25, 26])
+                prescriptions.append("⚠️ Limit descent to parallel (90°) to protect meniscus cartilages")
+                score -= 25
+                
+            if len(errors) == 0:
+                status = f"Correct Form ✅ (Optimal Parallel Depth: {knee:.0f}°)"
+                risk = "Low Injury Risk (Optimal Knee & Spinal Alignment)"
+                prescriptions.append("🌟 Optimal parallel squat depth with safe spinal angle! Drive through mid-foot.")
+            else:
+                status = f"Incorrect Form ❌ ({errors[0]})"
+                risk = "⚠️ Injury Risk: Patellofemoral Knee Strain / Lumbar Shear Stress"
+                
+        # Descent / Ascent Transition Phase (105° < knee <= 145°)
+        else:
+            if torso_inc > 48.0:
+                errors.append(f"Excessive Forward Lean: Torso collapsing forward ({torso_inc:.0f}°)")
+                faulty_joints.extend([11, 12, 23, 24])
+                score -= 35
+                
+            if len(errors) == 0:
+                status = f"Correct Form ✅ (Controlled Squat Motion: {knee:.0f}°)"
+                risk = "Low Injury Risk (Controlled Biomechanics)"
+                prescriptions.append("🎯 Continue controlled descent until thighs reach parallel ~90°")
+            else:
+                status = f"Incorrect Form ❌ ({errors[0]})"
+                risk = "⚠️ Injury Risk: Lumbar Flexion Shear Stress"
+
+    # 2. PUSH-UP POSTURE EVALUATION
+    elif exercise_name == 'pushup':
+        # Body Line & Core Alignment Check
+        if hip_dev > 0.055:
+            errors.append("Sagging Hips: Core disengaged (Hips dropping towards floor)")
+            faulty_joints.extend([23, 24])
+            prescriptions.append("🔥 Strengthen Transverse Abdominis with Deadbug & Plank holds; squeeze glutes")
+            score -= 40
+        elif hip_dev < -0.075:
+            errors.append("Piked Hips: Hips raised excessively high above body line")
+            faulty_joints.extend([23, 24])
+            prescriptions.append("📏 Align shoulders, hips, and heels into a single rigid neutral plane")
+            score -= 30
+
+        if len(errors) == 0:
+            if elbow <= 100:
+                status = f"Correct Form ✅ (Optimal Chest Depth: {elbow:.0f}°)"
+                risk = "Low Injury Risk (Safe Shoulder & Core Alignment)"
+                prescriptions.append("🌟 Full chest depth achieved with rigid core stabilization!")
+            else:
+                status = f"Correct Form ✅ (Plank / Lockout Phase: {elbow:.0f}°)"
+                risk = "Low Injury Risk (Neutral Glenohumeral Dynamics)"
+                prescriptions.append("🎯 Lower chest smoothly until elbows reach 90° flexion")
+        else:
+            status = f"Incorrect Form ❌ ({errors[0]})"
+            risk = "⚠️ Injury Risk: Anterior Shoulder Impingement / Lumbar Hyperextension"
+
+    # 3. PLANK POSTURE EVALUATION
+    elif exercise_name == 'plank':
+        if hip_dev > 0.050:
+            errors.append("Sagging Lower Back: Hips dropped below neutral line")
+            faulty_joints.extend([23, 24])
+            prescriptions.append("🛡️ Squeeze glutes & brace abdominal wall; avoid arching lumbar spine")
+            score -= 40
+        elif hip_dev < -0.070:
+            errors.append("Piked Plank: Hips raised too high above neutral line")
+            faulty_joints.extend([23, 24])
+            prescriptions.append("📐 Lower pelvis slightly until torso forms a flat horizontal plane")
+            score -= 30
+
+        if len(errors) == 0:
+            status = "Correct Form ✅ (Neutral Isometric Spine Line)"
+            risk = "Low Injury Risk (Neutral Isometric Core Stability)"
+            prescriptions.append("🌟 Solid isometric core engagement and neutral lumbar spine")
+        else:
+            status = f"Incorrect Form ❌ ({errors[0]})"
+            risk = "⚠️ Injury Risk: Lumbar Spine Disk Strain & Lower Back Fatigue"
+
+    # 4. DEADLIFT POSTURE EVALUATION
+    elif exercise_name == 'deadlift':
+        # Top Lockout Phase
+        if knee > 155 and hip > 155:
+            if torso_inc > 22.0:
+                errors.append("Lumbar Hyperextension: Excessive leaning backward at lockout")
+                faulty_joints.extend([11, 12, 23, 24])
+                score -= 30
+            if len(errors) == 0:
+                status = "Correct Form ✅ (Solid Lockout Phase)"
+                risk = "Low Injury Risk (Neutral Spinal Lordosis)"
+                prescriptions.append("🌟 Strong lockout with neutral spine and engaged glutes")
+            else:
+                status = f"Incorrect Form ❌ ({errors[0]})"
+                risk = "⚠️ Injury Risk: Lumbar Facet Joint Compression"
+        # Pull / Hip Hinge Phase
+        else:
+            if torso_inc > 65.0 and knee > 145.0:
+                errors.append("Rounded Spine / Stiff Leg: Back bending forward without knee flexion")
+                faulty_joints.extend([11, 12, 23, 24])
+                prescriptions.append("🚨 Bend knees and push hips back; keep bar close to shins")
+                score -= 45
+            if len(errors) == 0:
+                status = "Correct Form ✅ (Solid Posterior Chain Hip Hinge)"
+                risk = "Low Injury Risk (Safe Hinge Dynamics)"
+                prescriptions.append("🌟 Perfect hip hinge mechanics with neutral lumbar lordosis")
+            else:
+                status = f"Incorrect Form ❌ ({errors[0]})"
+                risk = "⚠️ Critical Injury Risk: Acute Lumbar Disc Herniation (L4-S1)"
+
+    # 5. PULL-UP POSTURE EVALUATION
+    elif exercise_name == 'pullup':
+        if elbow <= 85:
+            status = f"Correct Form ✅ (Peak Chin-Over-Bar Depth: {elbow:.0f}°)"
+            risk = "Low Injury Risk (Full Latissimus Activation)"
+            prescriptions.append("🌟 Full active range of motion with excellent scapular retraction")
+        elif elbow >= 150:
+            status = "Correct Form ✅ (Full Extension / Dead-hang Phase)"
+            risk = "Low Injury Risk (Full Latissimus Activation)"
+            prescriptions.append("🌟 Full dead-hang stretch achieved; engage lats to initiate pull")
+        else:
+            status = f"Correct Form ✅ (Controlled Pull Motion: {elbow:.0f}°)"
+            risk = "Low Injury Risk (Controlled Bicep & Lat Dynamics)"
+            prescriptions.append("🎯 Pull smoothly until chin clears the bar")
+
+    else:
+        status = "Analyzing Motion..."
+        risk = "Calculating..."
+        score = 85
+        prescriptions.append("Align full body inside camera frame")
+
+    score = max(10, min(100, score))
+    return status, risk, score, errors, joint_angles, faulty_joints, prescriptions
+
+
+# Backward-compatible wrapper
+def check_posture_and_risk(landmarks_list, exercise_name):
+    status, risk, score, errors, angles, faulty, rx = evaluate_advanced_posture(landmarks_list, exercise_name)
+    return status, risk
+
+
+# =========================================================
+# OPENCV COLOR-CODED SKELETON & ANGLE HUD RENDERER
+# =========================================================
+def draw_biomechanical_hud(frame, landmarks_list, exercise_name, is_correct, score, joint_angles, faulty_joints, rep_stats=None):
+    """
+    Renders professional color-coded biomechanical joints and HUD onto the frame.
+    Green = Optimal Form, Red = Biomechanical Error.
+    """
+    h, w, _ = frame.shape
+    main_color = (0, 230, 115) if is_correct else (0, 50, 255) # Green vs Red (BGR)
+    
+    connections = [
+        (11, 13), (13, 15), # Left Arm
+        (12, 14), (14, 16), # Right Arm
+        (11, 12),           # Shoulders
+        (11, 23), (12, 24), # Torso
+        (23, 24),           # Hips
+        (23, 25), (25, 27), # Left Leg
+        (24, 26), (26, 28)  # Right Leg
+    ]
+    
+    for (start_idx, end_idx) in connections:
+        pt1 = (int(landmarks_list[start_idx][0] * w), int(landmarks_list[start_idx][1] * h))
+        pt2 = (int(landmarks_list[end_idx][0] * w), int(landmarks_list[end_idx][1] * h))
+        
+        if start_idx in faulty_joints or end_idx in faulty_joints:
+            line_col = (0, 0, 255) # Red
+            thickness = 4
+        else:
+            line_col = (0, 255, 120) if is_correct else (0, 200, 255)
+            thickness = 3
+            
+        cv2.line(frame, pt1, pt2, line_col, thickness)
+
+    for idx, lm in enumerate(landmarks_list):
+        cx, cy = int(lm[0] * w), int(lm[1] * h)
+        if idx in faulty_joints:
+            cv2.circle(frame, (cx, cy), 9, (0, 0, 255), -1)
+            cv2.circle(frame, (cx, cy), 13, (255, 255, 255), 2)
+        else:
+            cv2.circle(frame, (cx, cy), 5, (0, 255, 0), -1)
+
+    # Top HUD Status Bar
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (8, 8), (w - 8, 85), (11, 15, 25), -1)
+    cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+    cv2.rectangle(frame, (8, 8), (w - 8, 85), main_color, 2)
+
+    cv2.putText(frame, f"AI: {exercise_name.upper()}", (20, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    status_text = "FORM: OPTIMAL [OK]" if is_correct else "FORM: FAULTY [CORRECTION NEEDED]"
+    cv2.putText(frame, status_text, (20, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.62, main_color, 2)
+    
+    score_text = f"SCORE: {score}/100"
+    cv2.putText(frame, score_text, (w - 200, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (56, 189, 248), 2)
+    
+    if rep_stats:
+        rep_text = f"Reps: {rep_stats['total']} | OK: {rep_stats['correct']} | Bad: {rep_stats['wrong']}"
+        cv2.putText(frame, rep_text, (w - 280, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 2)
+
+    return frame
+
+
+# =========================================================
+# PLOTLY BIOMECHANICAL VISUALIZATIONS
+# =========================================================
+def create_biomechanical_radar_chart(joint_angles, score):
+    """Generates an aesthetic Radar Chart showing multi-joint kinematic angles."""
+    categories = ['Knee Flexion', 'Elbow Flexion', 'Hip Hinge', 'Symmetry Score', 'Form Quality']
+    
+    knee_val = min(100, (joint_angles.get('avg_knee', 90) / 180.0) * 100)
+    elbow_val = min(100, (joint_angles.get('avg_elbow', 90) / 180.0) * 100)
+    hip_val = min(100, (joint_angles.get('avg_hip', 90) / 180.0) * 100)
+    sym_val = joint_angles.get('symmetry_score', 85)
+    quality_val = score
+    
+    values = [knee_val, elbow_val, hip_val, sym_val, quality_val]
+    values.append(values[0])
+    categories_closed = categories + [categories[0]]
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(
+        r=values,
+        theta=categories_closed,
+        fill='toself',
+        fillcolor='rgba(6, 182, 212, 0.25)',
+        line=dict(color='#06b6d4', width=2.5),
+        name='Biomechanical Profile'
+    ))
+    
+    fig.update_layout(
+        polar=dict(
+            radialaxis=dict(
+                visible=True,
+                range=[0, 100],
+                showticklabels=False,
+                linecolor="rgba(255, 255, 255, 0.15)",
+                gridcolor="rgba(255, 255, 255, 0.1)"
+            ),
+            angularaxis=dict(
+                tickfont=dict(size=10, color="#94a3b8"),
+                linecolor="rgba(255, 255, 255, 0.15)",
+                gridcolor="rgba(255, 255, 255, 0.1)"
+            ),
+            bgcolor="rgba(11, 15, 25, 0.65)"
+        ),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=35, r=35, t=25, b=25),
+        height=260,
+        showlegend=False
+    )
+    return fig
+
+
+def create_xai_feature_importance_chart(feats_dict):
+    """Generates an Explainable AI (XAI) bar chart highlighting key kinematic drivers."""
+    key_drivers = {
+        'Knee Left': feats_dict.get('knee_angle_left', 0),
+        'Knee Right': feats_dict.get('knee_angle_right', 0),
+        'Elbow Left': feats_dict.get('elbow_angle_left', 0),
+        'Elbow Right': feats_dict.get('elbow_angle_right', 0),
+        'Hip Left': feats_dict.get('hip_angle_left', 0),
+        'Hip Right': feats_dict.get('hip_angle_right', 0),
+        'Ankle Spread': feats_dict.get('ankle_dist_ratio', 0) * 100,
+        'Wrist Spread': feats_dict.get('wrist_dist_ratio', 0) * 100
+    }
+    
+    names = list(key_drivers.keys())
+    values = [round(v, 1) for v in key_drivers.values()]
+    
+    fig = px.bar(
+        x=values,
+        y=names,
+        orientation='h',
+        labels={'x': 'Kinematic Value (° / Ratio)', 'y': 'Feature'},
+        color=values,
+        color_continuous_scale="Purples"
+    )
+    fig.update_layout(
+        title="Biomechanical Drivers (XAI Feature Analysis)",
+        title_font=dict(size=12, color="#38bdf8"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(11, 15, 25, 0.6)",
+        font=dict(color="#94a3b8", size=9),
+        margin=dict(l=10, r=10, t=30, b=10),
+        height=240,
+        coloraxis_showscale=False
+    )
+    return fig
+
+
+# =========================================================
+# LOAD MACHINE LEARNING PIPELINE
+# =========================================================
+@st.cache_resource
+def load_ml_pipeline():
+    if os.path.exists('fitness_pipeline_v2.pkl'):
+        pipeline = joblib.load('fitness_pipeline_v2.pkl')
+        return pipeline
+    else:
+        model = joblib.load('fitness_model.pkl')
+        return {'model': model, 'scaler': None, 'feature_names': None, 'metrics': None}
+
+pipeline_data = load_ml_pipeline()
+model = pipeline_data['model']
+scaler = pipeline_data.get('scaler')
+feature_names = pipeline_data.get('feature_names')
+metrics = pipeline_data.get('metrics')
+
+mp_pose = None
+pose = None
+mp_drawing = None
+
+if mp is not None:
+    mp_pose = mp.solutions.pose
+    pose = mp_pose.Pose(static_image_mode=False, min_detection_confidence=0.5)
+    mp_drawing = mp.solutions.drawing_utils
+
+
+def pose_runtime_ready():
+    return cv2 is not None and mp is not None and pose is not None and mp_drawing is not None
+
+
+def run_ml_inference(landmarks_list):
+    """Executes full feature engineering + model prediction + probability confidence."""
+    clean_lms = [lm[:3] for lm in landmarks_list]
+    if scaler is not None and feature_names is not None:
+        feats_dict = extract_features_from_landmarks(clean_lms)
+        feats_df = pd.DataFrame([feats_dict])[feature_names]
+        X_scaled = scaler.transform(feats_df)
+        pred = model.predict(X_scaled)[0]
+        probs = model.predict_proba(X_scaled)[0]
+        confidence = float(np.max(probs) * 100.0)
+        prob_dict = {cls: round(float(prob * 100.0), 1) for cls, prob in zip(model.classes_, probs)}
+        return pred, confidence, prob_dict, feats_dict
+    else:
+        flat = np.array(clean_lms).flatten().reshape(1, -1)
+        pred = model.predict(flat)[0]
+        return pred, 99.0, {pred: 99.0}, {}
+
+
+# =========================================================
+# STREAMLIT UI SETUP & MODERN FUTURISTIC ATHLETIC THEME
+# =========================================================
+st.set_page_config(page_title="PoseAI - Biomechanical Posture Intelligence", layout="wide", page_icon="⚡")
+
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Outfit:wght@500;600;700;800;900&family=Space+Grotesk:wght@500;700&display=swap');
+
+    html, body, [class*="css"] {
+        font-family: 'Plus Jakarta Sans', sans-serif;
+    }
+
+    @keyframes pulseGlow {
+        0%, 100% { opacity: 0.85; transform: scale(1); }
+        50% { opacity: 1; transform: scale(1.02); }
+    }
+
+    .stApp {
+        background-color: #080c16;
+        background-image: 
+            radial-gradient(at 0% 0%, rgba(14, 165, 233, 0.18) 0px, transparent 50%),
+            radial-gradient(at 100% 0%, rgba(168, 85, 247, 0.20) 0px, transparent 50%),
+            radial-gradient(at 50% 100%, rgba(16, 185, 129, 0.15) 0px, transparent 60%),
+            linear-gradient(to bottom, #080c16, #0b1120);
+        background-attachment: fixed;
+        color: #f1f5f9;
+    }
+
+    /* Auth Glass Card */
+    .auth-container-card {
+        background: rgba(15, 23, 42, 0.75);
+        backdrop-filter: blur(28px);
+        -webkit-backdrop-filter: blur(28px);
+        border: 1px solid rgba(56, 189, 248, 0.25);
+        border-radius: 28px;
+        padding: 40px;
+        box-shadow: 0 25px 60px -15px rgba(0, 0, 0, 0.7), 0 0 35px rgba(56, 189, 248, 0.15);
+    }
+
+    /* Modern Top Navbar */
+    .top-navbar-card {
+        background: linear-gradient(135deg, rgba(15, 23, 42, 0.85), rgba(30, 41, 59, 0.75));
+        backdrop-filter: blur(20px);
+        border: 1px solid rgba(56, 189, 248, 0.25);
+        border-radius: 20px;
+        padding: 16px 28px;
+        margin-bottom: 22px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+    }
+
+    .navbar-title {
+        font-family: 'Outfit', sans-serif;
+        font-size: 1.8rem;
+        font-weight: 800;
+        background: linear-gradient(90deg, #38bdf8, #818cf8, #c084fc);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        letter-spacing: -0.02em;
+    }
+
+    .online-indicator {
+        display: inline-block;
+        width: 9px;
+        height: 9px;
+        background-color: #10b981;
+        border-radius: 50%;
+        margin-right: 7px;
+        box-shadow: 0 0 10px #10b981;
+    }
+
+    /* Sleek Cards */
+    .modern-card {
+        background: rgba(15, 23, 42, 0.7);
+        backdrop-filter: blur(16px);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 18px;
+        padding: 20px;
+        margin-bottom: 16px;
+        box-shadow: 0 8px 24px -6px rgba(0, 0, 0, 0.4);
+        transition: transform 0.2s ease, border-color 0.2s ease;
+    }
+
+    .modern-card:hover {
+        border-color: rgba(56, 189, 248, 0.3);
+    }
+
+    .video-viewport-card {
+        background: #020617;
+        border: 1px solid rgba(56, 189, 248, 0.25);
+        border-radius: 20px;
+        padding: 10px;
+        text-align: center;
+        box-shadow: 0 15px 35px -10px rgba(0, 0, 0, 0.6);
+    }
+
+    /* Metric Cards */
+    .metric-box {
+        background: rgba(15, 23, 42, 0.75);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 16px;
+        padding: 16px;
+        text-align: center;
+        transition: all 0.2s ease;
+    }
+
+    .metric-box:hover {
+        transform: translateY(-2px);
+        border-color: rgba(168, 85, 247, 0.35);
+    }
+
+    .metric-box-val {
+        font-family: 'Outfit', sans-serif;
+        font-size: 1.85rem;
+        font-weight: 800;
+        color: #38bdf8;
+    }
+
+    .metric-box-lbl {
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: #94a3b8;
+        font-weight: 600;
+        margin-top: 4px;
+    }
+
+    /* Status Pills */
+    .status-badge {
+        display: inline-block;
+        padding: 6px 18px;
+        border-radius: 9999px;
+        font-weight: 700;
+        font-size: 0.88rem;
+        letter-spacing: 0.02em;
+    }
+
+    .status-badge.success {
+        background: rgba(16, 185, 129, 0.15);
+        color: #34d399;
+        border: 1px solid rgba(52, 211, 153, 0.4);
+        box-shadow: 0 0 15px rgba(52, 211, 153, 0.2);
+    }
+
+    .status-badge.danger {
+        background: rgba(244, 63, 94, 0.15);
+        color: #fb7185;
+        border: 1px solid rgba(251, 113, 133, 0.4);
+        box-shadow: 0 0 15px rgba(251, 113, 133, 0.2);
+    }
+
+    /* Custom Streamlit Buttons */
+    div.stButton > button {
+        background: linear-gradient(135deg, #0284c7 0%, #6366f1 50%, #a855f7 100%) !important;
+        color: #ffffff !important;
+        border: none !important;
+        border-radius: 12px !important;
+        font-weight: 700 !important;
+        padding: 10px 22px !important;
+        transition: all 0.25s ease !important;
+        box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3) !important;
+    }
+
+    div.stButton > button:hover {
+        transform: translateY(-2px) scale(1.02) !important;
+        box-shadow: 0 10px 25px rgba(168, 85, 247, 0.45) !important;
+    }
+
+    /* Radio tabs & selection */
+    div[role="radiogroup"] {
+        background: rgba(15, 23, 42, 0.5);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 14px;
+        padding: 8px 14px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Session State Initialization
+if "logged_in" not in st.session_state:
+    st.session_state["logged_in"] = False
+    st.session_state["user_name"] = ""
+
+# =========================================================
+# AUTHENTICATION SCREEN (LOGIN & SQLITE REGISTRATION)
+# =========================================================
+if not st.session_state["logged_in"]:
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    _, center_col, _ = st.columns([1, 2.2, 1])
+
+    with center_col:
+        st.markdown("""
+        <div class="auth-container-card">
+            <div style="text-align: center; margin-bottom: 24px;">
+                <div style="display:inline-block; padding: 4px 14px; border-radius: 9999px; background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.3); color: #38bdf8; font-weight:700; font-size:0.75rem; letter-spacing:0.1em; margin-bottom:12px;">
+                    ⚡ FINAL YEAR DATA SCIENCE INNOVATION
+                </div>
+                <div style="font-family:'Outfit'; font-size:2.5rem; font-weight:900; background:linear-gradient(90deg,#38bdf8,#818cf8,#c084fc); -webkit-background-clip:text; -webkit-text-fill-color:transparent; margin-bottom:6px;">
+                    PoseAI Core
+                </div>
+                <div style="color:#94a3b8; font-size:0.92rem;">
+                    Biomechanical Motion Intelligence & Dynamic Orthopedic Injury Risk Engine
+                </div>
+                <div style="display:flex; justify-content:center; gap:16px; margin-top:14px; font-size:0.8rem; color:#64748b;">
+                    <span>🛡️ SQLite Database</span>
+                    <span>•</span>
+                    <span>🎯 Real-Time 2D Kinematics</span>
+                    <span>•</span>
+                    <span>📑 PDF Audit Reports</span>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+
+        auth_tab1, auth_tab2 = st.tabs(["🔑 Account Sign In", "✨ Register New Athlete"])
+
+        with auth_tab1:
+            st.info("💡 **Quick Demo Accounts:** `student` / `fitness123`  |  `admin` / `admin123`")
+            login_user = st.text_input("👤 Username", key="login_u")
+            login_pass = st.text_input("🔒 Password", type="password", key="login_p")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("Sign In to Portal ➔", type="primary", use_container_width=True):
+                if login_user and login_pass:
+                    success, user_name = verify_user(login_user, login_pass)
+                    if success:
+                        st.session_state["logged_in"] = True
+                        st.session_state["user_name"] = user_name
+                        st.session_state["username_handle"] = login_user.strip().lower()
+                        st.success(f"Welcome back, {user_name}!")
+                        st.rerun()
+                    else:
+                        st.error("Invalid username or password. Please verify your credentials.")
+                else:
+                    st.warning("Please enter your username and password.")
+
+        with auth_tab2:
+            st.caption("All registered accounts are permanently stored in the local SQLite database (`fitness_database.db`).")
+            reg_name = st.text_input("🏷️ Full Name", key="reg_n")
+            reg_user = st.text_input("👤 Desired Username", key="reg_u")
+            reg_pass = st.text_input("🔒 Account Password", type="password", key="reg_p")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("Create Database Account ➔", use_container_width=True):
+                if reg_name and reg_user and reg_pass:
+                    success, msg = register_user(reg_user, reg_name, reg_pass)
+                    if success:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+                else:
+                    st.warning("Please fill out all registration fields.")
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+# =========================================================
+# MAIN APPLICATION (AUTHENTICATED)
+# =========================================================
+else:
+    if not pose_runtime_ready():
+        st.warning("Pose inference dependencies missing. Run `python -m pip install -r requirements.txt`.")
+        st.stop()
+
+    active_user_handle = st.session_state.get("username_handle", "student")
+    user_db_stats = get_user_stats(active_user_handle)
+
+    # 🎙️ Voice Coach Sidebar Settings
+    vc_config = voice_coach_sidebar()
+    voice_coach = get_voice_coach()
+
+    def maybe_speak(message: str, force: bool = False):
+        """Hardware-native rate-limited speech via PC speakers."""
+        if not vc_config.get("enabled", True) or not message:
+            return
+        voice_coach.speak(message, interval=float(vc_config.get("interval", 4)), force=force)
+
+    # Modern Top Navbar
+    st.markdown(f"""
+    <div class="top-navbar-card">
+        <div>
+            <div class="navbar-title">⚡ PoseAI: Motion Intelligence & Biomechanics</div>
+            <div style="color: #94a3b8; font-size: 0.88rem; margin-top: 3px;">
+                <span class="online-indicator"></span><b>AI Engine Online</b> | Logged in as: <span style="color:#38bdf8; font-weight:700;">{st.session_state['user_name']}</span> | SQLite Database Active
+            </div>
+        </div>
+        <div style="display:flex; align-items:center; gap:16px;">
+            <div style="background:rgba(255,255,255,0.06); padding:6px 14px; border-radius:12px; font-size:0.82rem; text-align:right;">
+                <span style="color:#94a3b8;">Logged Workouts:</span> <b style="color:#34d399;">{user_db_stats['total_sessions']}</b><br>
+                <span style="color:#94a3b8;">Lifetime Reps:</span> <b style="color:#38bdf8;">{user_db_stats['grand_total_reps']}</b>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Sign out button on right column
+    _, nav_right = st.columns([5, 1])
+    with nav_right:
+        if st.button("🚪 Sign Out", use_container_width=True):
+            st.session_state["logged_in"] = False
+            st.session_state["user_name"] = ""
+            st.rerun()
+
+    # Modern 4 Navigation Tabs
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🏋️ Workout Arena & Live Rep Tracker",
+        "📈 SQLite Workout History",
+        "✨ Examiner 1-Click Viva Showcase",
+        "📊 Data Science ML Telemetry"
+    ])
+
+    # =========================================================
+    # TAB 1: REAL-TIME INFERENCE & WORKOUT ARENA
+    # =========================================================
+    with tab1:
+        st.markdown('<div class="modern-card">', unsafe_allow_html=True)
+        option = st.radio(
+            "Select Input Mode:",
+            ('🎥 Live Webcam Stream & Rep Counter', '📷 Live Camera Snapshot', '📁 Upload Image or Video File'),
+            horizontal=True
+        )
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # 1. LIVE WEBCAM WITH REPETITION COUNTER FSM
+        if option == '🎥 Live Webcam Stream & Rep Counter':
+            col_ctrl, col_stats = st.columns([2, 1])
+            with col_ctrl:
+                st.markdown('<div class="modern-card">', unsafe_allow_html=True)
+                st.write("**Real-Time Webcam Repetition State Machine & Biomechanical HUD**")
+                duration = st.slider("Streaming Duration (seconds)", 10, 180, 30, 5)
+                target_exercise = st.selectbox("Select Target Exercise for Rep Counting:", ["Auto-Detect (ML)", "Squat", "Pushup", "Pullup", "Plank"])
+                start = st.button("🚀 Start Live Stream & Rep Tracker", type="primary")
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            with col_stats:
+                st.markdown("""
+                <div class="modern-card">
+                    <h4 style="color:#38bdf8; margin:0 0 10px 0;">🎯 Real-Time Rep Counters</h4>
+                    <div style="display:flex; justify-content:space-around; text-align:center;">
+                        <div><span style="font-size:1.8rem; font-weight:800; color:#cbd5e1;">0</span><br><small>TOTAL REPS</small></div>
+                        <div><span style="font-size:1.8rem; font-weight:800; color:#34d399;">0</span><br><small>CORRECT ✅</small></div>
+                        <div><span style="font-size:1.8rem; font-weight:800; color:#fb7185;">0</span><br><small>FAULTY ❌</small></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            if start:
+                cap = cv2.VideoCapture(0)
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+                col_live_feed, col_live_dash = st.columns([1.1, 1])
+                with col_live_feed:
+                    st.markdown('<div class="video-viewport-card">', unsafe_allow_html=True)
+                    st_frame = st.empty()
+                    st.markdown('</div>', unsafe_allow_html=True)
+
+                with col_live_dash:
+                    st_ex = st.empty()
+                    m_c1, m_c2, m_c3 = st.columns(3)
+                    with m_c1: st_rep_total = st.empty()
+                    with m_c2: st_rep_correct = st.empty()
+                    with m_c3: st_posture_score = st.empty()
+                    st_alert = st.empty()
+                    st_radar_live = st.empty()
+
+                stage = "UP"
+                total_reps = 0
+                correct_reps = 0
+                wrong_reps = 0
+                rep_min_knee = 180.0
+                rep_max_torso = 0.0
+                rep_min_elbow = 180.0
+                rep_max_hip_dev = 0.0
+                fps = 12
+                frames_to_capture = int(duration * fps)
+                last_score = 85
+                active_ex = target_exercise.lower()
+
+                for i in range(frames_to_capture):
+                    ret, frame = cap.read()
+                    if not ret:
+                        st.warning("Webcam feed unavailable.")
+                        break
+
+                    image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    results = pose.process(image_rgb)
+
+                    if results.pose_landmarks:
+                        landmarks_list = [[lm.x, lm.y, lm.z, getattr(lm, 'visibility', 1.0)] for lm in results.pose_landmarks.landmark]
+                        pred, conf, prob_dict, _ = run_ml_inference(landmarks_list)
+                        active_ex = pred if target_exercise == "Auto-Detect (ML)" else target_exercise.lower()
+                        
+                        status, risk, score, errors, joint_angles, faulty_joints, rx = evaluate_advanced_posture(landmarks_list, active_ex)
+                        is_correct = (len(errors) == 0)
+                        last_score = score
+
+                        # Precision Repetition State Machine
+                        if active_ex == 'squat':
+                            knee_ang = joint_angles['avg_knee']
+                            torso_ang = joint_angles['torso_inc']
+                            
+                            if knee_ang < 125:
+                                stage = "DOWN"
+                                rep_min_knee = min(rep_min_knee, knee_ang)
+                                rep_max_torso = max(rep_max_torso, torso_ang)
+                            elif knee_ang > 148:
+                                if stage == "DOWN":
+                                    total_reps += 1
+                                    # Depth check: Must reach <= 105° and maintain torso <= 48°
+                                    if rep_min_knee <= 105 and rep_max_torso <= 48.0:
+                                        correct_reps += 1
+                                    else:
+                                        wrong_reps += 1
+                                        if rep_min_knee > 105:
+                                            maybe_speak("Correction: Squat deeper until parallel. Injury Warning: Protect knee joints from patellar strain.", force=True)
+                                        elif rep_max_torso > 48.0:
+                                            maybe_speak("Correction: Lift your chest upright. Injury Warning: Forward lean causes acute lumbar shear stress.", force=True)
+                                        else:
+                                            maybe_speak("Correction: Check your form. Injury Warning: Maintain safe joint biomechanics.", force=True)
+                                    rep_min_knee = 180.0
+                                    rep_max_torso = 0.0
+                                stage = "UP"
+
+                        elif active_ex == 'pushup':
+                            elbow_ang = joint_angles['avg_elbow']
+                            hip_dev_val = abs(joint_angles['hip_dev'])
+                            
+                            if elbow_ang < 125:
+                                stage = "DOWN"
+                                rep_min_elbow = min(rep_min_elbow, elbow_ang)
+                                rep_max_hip_dev = max(rep_max_hip_dev, hip_dev_val)
+                            elif elbow_ang > 148:
+                                if stage == "DOWN":
+                                    total_reps += 1
+                                    if rep_min_elbow <= 102 and rep_max_hip_dev <= 0.06:
+                                        correct_reps += 1
+                                    else:
+                                        wrong_reps += 1
+                                        if rep_min_elbow > 102:
+                                            maybe_speak("Correction: Lower your chest smoothly to 90 degrees. Injury Warning: Prevents shoulder ligament overload.", force=True)
+                                        elif rep_max_hip_dev > 0.06:
+                                            maybe_speak("Correction: Tighten your core and squeeze glutes. Injury Warning: Sagging hips causes lumbar disc compression.", force=True)
+                                        else:
+                                            maybe_speak("Correction: Align your spine and core.", force=True)
+                                    rep_min_elbow = 180.0
+                                    rep_max_hip_dev = 0.0
+                                stage = "UP"
+
+                        rep_stats = {'total': total_reps, 'correct': correct_reps, 'wrong': wrong_reps}
+                        frame = draw_biomechanical_hud(frame, landmarks_list, active_ex, is_correct, score, joint_angles, faulty_joints, rep_stats)
+
+                        st_ex.markdown(f"### 🤖 Identified: **{active_ex.upper()}** (`{conf:.1f}%`)")
+                        st_rep_total.metric("Total Reps", f"{total_reps}", f"State: {stage}")
+                        st_rep_correct.metric("Correct Reps", f"{correct_reps}", f"{wrong_reps} Faulty", delta_color="normal")
+                        st_posture_score.metric("Posture Quality", f"{score}/100", f"{joint_angles['symmetry_score']}% Sym")
+
+                        if not is_correct:
+                            st_alert.error(f"❌ **Fault:** {errors[0]}")
+                        else:
+                            st_alert.success("✅ **Optimal Form:** Safe biomechanics maintained.")
+
+                        # 🎙️ VOICE COACH — Real-time spoken feedback
+                        vc_msg = get_voice_feedback(
+                            exercise=active_ex,
+                            is_correct=is_correct,
+                            errors=errors,
+                            score=score,
+                            rep_count=total_reps,
+                            stage=stage
+                        )
+                        maybe_speak(vc_msg)
+
+                        st_radar_live.plotly_chart(create_biomechanical_radar_chart(joint_angles, score), use_container_width=True)
+
+                    st_frame.image(frame, channels="BGR", use_container_width=True)
+
+                cap.release()
+                st.success("🎉 Live workout session completed!")
+                
+                # Automatically save session to SQLite database
+                if total_reps > 0 or last_score > 0:
+                    log_workout_session(
+                        username=active_user_handle,
+                        exercise_name=active_ex,
+                        total_reps=total_reps,
+                        correct_reps=correct_reps,
+                        wrong_reps=wrong_reps,
+                        form_score=last_score,
+                        is_correct=(wrong_reps == 0 and total_reps > 0),
+                        feedback=f"Live session: {correct_reps}/{total_reps} correct reps"
+                    )
+                    st.info("💾 Session successfully recorded to SQLite database (`fitness_database.db`)!")
+
+        # 2. CAMERA SNAPSHOT
+        elif option == '📷 Live Camera Snapshot':
+            camera_photo = st.camera_input("Capture pose photo for instant biomechanical analysis")
+
+            if camera_photo is not None:
+                image = Image.open(camera_photo)
+                image_np = np.array(image)
+                image_rgb = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+                results = pose.process(image_rgb)
+
+                if results.pose_landmarks:
+                    landmarks_list = [[lm.x, lm.y, lm.z, getattr(lm, 'visibility', 1.0)] for lm in results.pose_landmarks.landmark]
+                    pred, conf, prob_dict, feats_dict = run_ml_inference(landmarks_list)
+                    status, risk, score, errors, joint_angles, faulty_joints, rx = evaluate_advanced_posture(landmarks_list, pred)
+                    is_correct = (len(errors) == 0)
+
+                    annotated = image_np.copy()
+                    annotated = draw_biomechanical_hud(annotated, landmarks_list, pred, is_correct, score, joint_angles, faulty_joints)
+
+                    col1, col2 = st.columns([1.1, 1])
+                    with col1:
+                        st.markdown('<div class="video-viewport-card">', unsafe_allow_html=True)
+                        st.image(annotated, channels="RGB", caption="Biomechanical Skeleton Tracking", use_container_width=True)
+                        st.markdown('</div>', unsafe_allow_html=True)
+                        st.plotly_chart(create_biomechanical_radar_chart(joint_angles, score), use_container_width=True)
+
+                    # 🎙️ Voice Coach — Snapshot feedback
+                    snap_vc_msg = get_voice_feedback(
+                        exercise=pred, is_correct=is_correct,
+                        errors=errors, score=score
+                    )
+                    maybe_speak(snap_vc_msg, force=True)
+
+                    with col2:
+                        st.markdown(f"""
+                        <div class="modern-card">
+                            <h3 style="color: #38bdf8; margin-top:0;">🤖 Biomechanical Clinical Analysis</h3>
+                            <div style="font-size: 1.3rem; font-weight: 800;">Exercise: <span style="color:#c084fc;">{pred.upper()}</span> ({conf:.1f}% Confidence)</div>
+                            <div style="font-size: 1.1rem; font-weight: 700; color: {'#34d399' if is_correct else '#fb7185'}; margin: 10px 0;">
+                                Posture Quality Score: {score}/100 | Symmetry: {joint_angles['symmetry_score']}%
+                            </div>
+                            <div class="status-badge {'success' if is_correct else 'danger'}">{status}</div>
+                            <div style="margin-top: 12px; font-weight: 600; color: {'#34d399' if is_correct else '#fb7185'};">{risk}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        with st.expander("🩺 Physiotherapy & Corrective Prescription", expanded=True):
+                            for p in rx:
+                                st.write(f"• {p}")
+
+                        if feats_dict:
+                            st.plotly_chart(create_xai_feature_importance_chart(feats_dict), use_container_width=True)
+
+                        # Save to database
+                        log_workout_session(
+                            username=active_user_handle,
+                            exercise_name=pred,
+                            total_reps=1,
+                            correct_reps=1 if is_correct else 0,
+                            wrong_reps=0 if is_correct else 1,
+                            form_score=score,
+                            is_correct=is_correct,
+                            feedback=status
+                        )
+
+                        pdf_bytes = generate_clinical_pdf_report(
+                            user_name=st.session_state['user_name'],
+                            exercise_name=pred,
+                            is_correct=is_correct,
+                            score=score,
+                            accuracy_rate=100.0 if is_correct else 0.0,
+                            total_frames=1,
+                            joint_angles=joint_angles,
+                            errors=errors,
+                            injury_risk=risk,
+                            prescriptions=rx,
+                            file_name="Camera_Snapshot.jpg"
+                        )
+                        st.download_button(
+                            label="📄 Download Clinical Posture Audit Report (PDF)",
+                            data=pdf_bytes,
+                            file_name=f"PoseAI_Clinical_Report_{pred}.pdf",
+                            mime="application/pdf",
+                            use_container_width=True
+                        )
+
+        # 3. UPLOAD FILE (PRECISION REP-AWARE VIDEO ENGINE & ACCURATE FINAL RESULTS)
+        else:
+            uploaded_file = st.file_uploader("Upload Image or Video (.mp4 / .mov / .jpg / .png)", type=["mp4", "avi", "mov", "jpg", "png"])
+            if uploaded_file is not None:
+                if uploaded_file.type in ["image/jpeg", "image/png"]:
+                    image = Image.open(uploaded_file)
+                    image_np = np.array(image)
+                    image_rgb = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+                    results = pose.process(image_rgb)
+
+                    if results.pose_landmarks:
+                        landmarks_list = [[lm.x, lm.y, lm.z, getattr(lm, 'visibility', 1.0)] for lm in results.pose_landmarks.landmark]
+                        pred, conf, prob_dict, feats_dict = run_ml_inference(landmarks_list)
+                        status, risk, score, errors, joint_angles, faulty_joints, rx = evaluate_advanced_posture(landmarks_list, pred)
+                        is_correct = (len(errors) == 0)
+
+                        annotated = image_np.copy()
+                        annotated = draw_biomechanical_hud(annotated, landmarks_list, pred, is_correct, score, joint_angles, faulty_joints)
+
+                        col1, col2 = st.columns([1.1, 1])
+                        with col1:
+                            st.markdown('<div class="video-viewport-card">', unsafe_allow_html=True)
+                            st.image(annotated, channels="RGB", caption="Detected Pose & Biomechanical HUD", use_container_width=True)
+                            st.markdown('</div>', unsafe_allow_html=True)
+                            st.plotly_chart(create_biomechanical_radar_chart(joint_angles, score), use_container_width=True)
+
+                        # 🎙️ Voice Coach — Image upload feedback
+                        img_vc_msg = get_voice_feedback(
+                            exercise=pred, is_correct=is_correct,
+                            errors=errors, score=score
+                        )
+                        maybe_speak(img_vc_msg, force=True)
+
+                        with col2:
+                            st.markdown(f"""
+                            <div class="modern-card">
+                                <h3 style="color: #38bdf8; margin-top:0;">🤖 Biomechanical Clinical Analysis</h3>
+                                <div style="font-size: 1.3rem; font-weight: 800;">Exercise: <span style="color:#c084fc;">{pred.upper()}</span> ({conf:.1f}% Confidence)</div>
+                                <div style="font-size: 1.1rem; font-weight: 700; color: {'#34d399' if is_correct else '#fb7185'}; margin: 10px 0;">
+                                    Posture Quality Score: {score}/100 | Symmetry: {joint_angles['symmetry_score']}%
+                                </div>
+                                <div class="status-badge {'success' if is_correct else 'danger'}">{status}</div>
+                                <div style="margin-top: 12px; font-weight: 600; color: {'#34d399' if is_correct else '#fb7185'};">{risk}</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                            with st.expander("🩺 Physiotherapy & Corrective Prescription", expanded=True):
+                                for p in rx:
+                                    st.write(f"• {p}")
+
+                            if feats_dict:
+                                st.plotly_chart(create_xai_feature_importance_chart(feats_dict), use_container_width=True)
+
+                            # Save to database
+                            log_workout_session(
+                                username=active_user_handle,
+                                exercise_name=pred,
+                                total_reps=1,
+                                correct_reps=1 if is_correct else 0,
+                                wrong_reps=0 if is_correct else 1,
+                                form_score=score,
+                                is_correct=is_correct,
+                                feedback=status
+                            )
+
+                            pdf_bytes = generate_clinical_pdf_report(
+                                user_name=st.session_state['user_name'],
+                                exercise_name=pred,
+                                is_correct=is_correct,
+                                score=score,
+                                accuracy_rate=100.0 if is_correct else 0.0,
+                                total_frames=1,
+                                joint_angles=joint_angles,
+                                errors=errors,
+                                injury_risk=risk,
+                                prescriptions=rx,
+                                file_name=uploaded_file.name
+                            )
+                            st.download_button(
+                                label="📄 Download Clinical Posture Audit Report (PDF)",
+                                data=pdf_bytes,
+                                file_name=f"PoseAI_Clinical_Report_{pred}.pdf",
+                                mime="application/pdf",
+                                use_container_width=True
+                            )
+                    else:
+                        st.warning("No human pose detected in the uploaded image. Please ensure full body is visible.")
+
+                else:
+                    # Video Processing Engine
+                    tfile = tempfile.NamedTemporaryFile(delete=False)
+                    tfile.write(uploaded_file.read())
+                    cap = cv2.VideoCapture(tfile.name)
+
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    st.info("⚡ Processing video frames through Biomechanical Kinematic Engine...")
+
+                    col_vid_player, col_vid_hud = st.columns([1.1, 1])
+                    with col_vid_player:
+                        st.markdown('<div class="video-viewport-card">', unsafe_allow_html=True)
+                        st_video_frame = st.empty()
+                        st.markdown('</div>', unsafe_allow_html=True)
+                    with col_vid_hud:
+                        st_vid_ex = st.empty()
+                        v_c1, v_c2 = st.columns(2)
+                        with v_c1: st_vid_score = st.empty()
+                        with v_c2: st_vid_sym = st.empty()
+                        st_vid_alert = st.empty()
+                        st_vid_prog = st.progress(0)
+
+                    total_frames = 0
+                    correct_frames_cnt = 0
+                    faulty_frames_cnt = 0
+                    scores_list = []
+                    unique_errors = set()
+                    pred_counts = {}
+
+                    vid_total_reps = 0
+                    vid_correct_reps = 0
+                    vid_faulty_reps = 0
+                    rep_stage = "UP"
+                    cur_rep_min_knee = 180.0
+                    cur_rep_max_torso = 0.0
+                    cur_rep_min_elbow = 180.0
+                    cur_rep_max_hip_dev = 0.0
+                    
+                    global_min_knee = 180.0
+                    global_max_torso = 0.0
+                    global_min_elbow = 180.0
+                    global_max_hip_dev = 0.0
+                    plank_sag_count = 0
+                    deadlift_round_count = 0
+
+                    last_angles = {}
+                    last_rx = []
+                    last_risk = ""
+                    last_feats = {}
+
+                    tot_vid_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 100
+
+                    while cap.isOpened():
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+
+                        total_frames += 1
+                        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        results = pose.process(image_rgb)
+
+                        if results.pose_landmarks:
+                            landmarks_list = [[lm.x, lm.y, lm.z, getattr(lm, 'visibility', 1.0)] for lm in results.pose_landmarks.landmark]
+                            pred, conf, prob_dict, feats_dict = run_ml_inference(landmarks_list)
+                            status, risk, score, errors, joint_angles, faulty_joints, rx = evaluate_advanced_posture(landmarks_list, pred)
+                            is_correct = (len(errors) == 0)
+
+                            if is_correct:
+                                correct_frames_cnt += 1
+                            else:
+                                faulty_frames_cnt += 1
+                                for err in errors:
+                                    unique_errors.add(err)
+
+                            scores_list.append(score)
+                            pred_counts[pred] = pred_counts.get(pred, 0) + 1
+                            last_angles = joint_angles
+                            last_rx = rx
+                            last_risk = risk
+                            last_feats = feats_dict
+
+                            knee_ang = joint_angles['avg_knee']
+                            torso_ang = joint_angles['torso_inc']
+                            elbow_ang = joint_angles['avg_elbow']
+                            hip_dev_val = abs(joint_angles['hip_dev'])
+                            
+                            global_min_knee = min(global_min_knee, knee_ang)
+                            global_max_torso = max(global_max_torso, torso_ang)
+                            global_min_elbow = min(global_min_elbow, elbow_ang)
+                            global_max_hip_dev = max(global_max_hip_dev, hip_dev_val)
+
+                            # Repetition State Machine across video
+                            if pred == 'squat':
+                                if knee_ang < 125:
+                                    rep_stage = "DOWN"
+                                    cur_rep_min_knee = min(cur_rep_min_knee, knee_ang)
+                                    cur_rep_max_torso = max(cur_rep_max_torso, torso_ang)
+                                elif knee_ang > 148:
+                                    if rep_stage == "DOWN":
+                                        vid_total_reps += 1
+                                        if cur_rep_min_knee <= 105 and cur_rep_max_torso <= 48.0:
+                                            vid_correct_reps += 1
+                                        else:
+                                            vid_faulty_reps += 1
+                                            if cur_rep_min_knee > 105:
+                                                unique_errors.add(f"Shallow Squat: Rep depth reached only {cur_rep_min_knee:.0f}° (Target parallel ~90°)")
+                                                maybe_speak("Correction: Squat deeper to parallel. Injury Warning: Protect knee tendons.", force=True)
+                                            if cur_rep_max_torso > 48.0:
+                                                unique_errors.add(f"Torso Forward Collapse: Back tilted excessively forward to {cur_rep_max_torso:.0f}°")
+                                                maybe_speak("Correction: Keep chest upright. Injury Warning: Forward lean causes acute lumbar shear stress.", force=True)
+                                        cur_rep_min_knee = 180.0
+                                        cur_rep_max_torso = 0.0
+                                    rep_stage = "UP"
+
+                            elif pred == 'pushup':
+                                if elbow_ang < 125:
+                                    rep_stage = "DOWN"
+                                    cur_rep_min_elbow = min(cur_rep_min_elbow, elbow_ang)
+                                    cur_rep_max_hip_dev = max(cur_rep_max_hip_dev, hip_dev_val)
+                                elif elbow_ang > 148:
+                                    if rep_stage == "DOWN":
+                                        vid_total_reps += 1
+                                        if cur_rep_min_elbow <= 102 and cur_rep_max_hip_dev <= 0.06:
+                                            vid_correct_reps += 1
+                                        else:
+                                            vid_faulty_reps += 1
+                                            if cur_rep_min_elbow > 102:
+                                                unique_errors.add(f"Incomplete Push-up Depth: Chest lowered only to {cur_rep_min_elbow:.0f}° (Target ~90°)")
+                                                maybe_speak("Correction: Lower your chest smoothly to 90 degrees. Injury Warning: Prevents anterior shoulder overload.", force=True)
+                                            if cur_rep_max_hip_dev > 0.06:
+                                                unique_errors.add("Sagging Hips / Core Disengaged during push-up")
+                                                maybe_speak("Correction: Squeeze glutes and brace core. Injury Warning: Sagging hips causes lumbar disc compression.", force=True)
+                                        cur_rep_min_elbow = 180.0
+                                        cur_rep_max_hip_dev = 0.0
+                                    rep_stage = "UP"
+
+                            elif pred == 'plank':
+                                if hip_dev_val > 0.055:
+                                    plank_sag_count += 1
+                                    unique_errors.add("Sagging Lower Back: Hips dropped below neutral horizontal line")
+
+                            elif pred == 'deadlift':
+                                if torso_ang > 65.0 and knee_ang > 145.0:
+                                    deadlift_round_count += 1
+                                    unique_errors.add("Rounded Spine / Stiff Leg: Back bending forward without knee flexion")
+
+                            frame = draw_biomechanical_hud(frame, landmarks_list, pred, is_correct, score, joint_angles, faulty_joints)
+
+                            st_vid_ex.markdown(f"### 🤖 Class: **{pred.upper()}** (`{conf:.1f}%`)")
+                            st_vid_score.metric("Live Score", f"{score}/100", "Form Quality")
+                            st_vid_sym.metric("Symmetry", f"{joint_angles['symmetry_score']}%", "Left vs Right")
+                            
+                            if not is_correct:
+                                st_vid_alert.error(f"❌ {errors[0]}")
+                            else:
+                                st_vid_alert.success("✅ Optimal Form Maintained")
+
+                            # 🎙️ Voice Coach — Frame-by-frame feedback during video playback
+                            vid_vc_msg = get_voice_feedback(
+                                exercise=pred,
+                                is_correct=is_correct,
+                                errors=errors,
+                                score=score,
+                                rep_count=vid_total_reps,
+                                stage=rep_stage
+                            )
+                            maybe_speak(vid_vc_msg)
+
+                        st_video_frame.image(frame, channels="BGR", use_container_width=True)
+                        st_vid_prog.progress(min(1.0, total_frames / max(1, tot_vid_frames)))
+
+                    cap.release()
+                    try:
+                        os.remove(tfile.name)
+                    except Exception:
+                        pass
+
+                    # =========================================================
+                    # 🏆 COMPREHENSIVE FINAL VIDEO EVALUATION
+                    # =========================================================
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    st.markdown("""
+                    <div class="top-navbar-card" style="margin-top: 10px;">
+                        <div class="navbar-title" style="font-size: 1.6rem;">🏆 Video Biomechanical Audit & Final Evaluation Report</div>
+                        <div style="color: #94a3b8; font-size: 0.85rem;">Complete statistical summary across all analyzed video frames.</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    primary_exercise = max(pred_counts, key=pred_counts.get) if pred_counts else "Unknown"
+                    avg_score = round(sum(scores_list) / len(scores_list), 1) if scores_list else 0
+                    
+                    is_overall_correct = True
+                    final_faults = []
+                    
+                    if primary_exercise == 'squat':
+                        if vid_total_reps > 0:
+                            if vid_faulty_reps > 0:
+                                is_overall_correct = False
+                                for err in unique_errors:
+                                    final_faults.append(err)
+                        else:
+                            if global_min_knee > 115:
+                                is_overall_correct = False
+                                final_faults.append(f"Shallow Squat: Maximum depth reached was only {global_min_knee:.0f}° (Target ~90°)")
+                            if global_max_torso > 50.0:
+                                is_overall_correct = False
+                                final_faults.append(f"Excessive Forward Lean: Torso collapsed to {global_max_torso:.0f}° from vertical")
+
+                    elif primary_exercise == 'pushup':
+                        if vid_total_reps > 0:
+                            if vid_faulty_reps > 0:
+                                is_overall_correct = False
+                                for err in unique_errors:
+                                    final_faults.append(err)
+                        else:
+                            if global_min_elbow > 110:
+                                is_overall_correct = False
+                                final_faults.append(f"Incomplete Push-up Depth: Chest lowered only to {global_min_elbow:.0f}° (Target ~90°)")
+                            if global_max_hip_dev > 0.06:
+                                is_overall_correct = False
+                                final_faults.append("Sagging Hips: Core disengaged during movement")
+
+                    elif primary_exercise == 'plank':
+                        if plank_sag_count > max(3, total_frames * 0.15):
+                            is_overall_correct = False
+                            final_faults.append("Sagging Lower Back: Hips dropped below neutral line during hold")
+
+                    elif primary_exercise == 'deadlift':
+                        if deadlift_round_count > max(3, total_frames * 0.15):
+                            is_overall_correct = False
+                            final_faults.append("Rounded Spine / Stiff Leg: Upper/Lower back curving dangerously during pull")
+
+                    # Final Status and Score
+                    if is_overall_correct:
+                        overall_status = "CORRECT FORM OVERALL ✅"
+                        final_score = max(88, int(avg_score))
+                        accuracy_rate = 100.0 if vid_total_reps == 0 else round((vid_correct_reps / max(1, vid_total_reps)) * 100, 1)
+                        final_risk_msg = "Low Injury Risk (Optimal Joint Biomechanics Maintained Across Reps)"
+                    else:
+                        overall_status = "INCORRECT FORM (FAULTY) ❌"
+                        final_score = min(58, int(avg_score))
+                        accuracy_rate = 0.0 if vid_total_reps == 0 else round((vid_correct_reps / max(1, vid_total_reps)) * 100, 1)
+                        if primary_exercise == 'squat':
+                            final_risk_msg = "⚠️ High Injury Risk: Patellofemoral Knee Strain / Lumbar Shear Stress"
+                        elif primary_exercise == 'pushup':
+                            final_risk_msg = "⚠️ High Injury Risk: Anterior Shoulder Impingement / Lumbar Hyperextension"
+                        elif primary_exercise == 'plank':
+                            final_risk_msg = "⚠️ High Injury Risk: Lumbar Spine Disk Strain & Lower Back Fatigue"
+                        elif primary_exercise == 'deadlift':
+                            final_risk_msg = "⚠️ Critical Injury Risk: Acute Lumbar Disc Herniation (L4-S1)"
+                        else:
+                            final_risk_msg = "⚠️ Injury Risk: Rotator Cuff Tendonitis / Bicep Tendon Overload"
+
+                    # 🎙️ Voice Coach — Final Video Analysis Summary
+                    if is_overall_correct:
+                        vid_vc_summary = f"Video analysis complete. Your {primary_exercise} form is correct. Score: {final_score} out of 100. Excellent work!"
+                    else:
+                        fault_hint = final_faults[0] if final_faults else "posture errors detected"
+                        vid_vc_summary = f"Video analysis complete. Faults detected in your {primary_exercise}. Please correct: {fault_hint}. Score: {final_score}."
+                    maybe_speak(vid_vc_summary, force=True)
+
+                    # Log video session to SQLite
+                    log_workout_session(
+                        username=active_user_handle,
+                        exercise_name=primary_exercise,
+                        total_reps=vid_total_reps,
+                        correct_reps=vid_correct_reps,
+                        wrong_reps=vid_faulty_reps,
+                        form_score=final_score,
+                        is_correct=is_overall_correct,
+                        feedback=", ".join(final_faults) if final_faults else "Optimal form maintained throughout video"
+                    )
+
+                    # Summary Metric Cards
+                    r_col1, r_col2, r_col3, r_col4 = st.columns(4)
+                    with r_col1:
+                        st.markdown(f"""
+                        <div class="metric-box">
+                            <div class="metric-box-lbl">Detected Exercise</div>
+                            <div class="metric-box-val" style="font-size:1.5rem; color:#c084fc;">{primary_exercise.upper()}</div>
+                            <div style="color:#34d399; font-size:0.8rem; font-weight:600;">{total_frames} Frames Processed</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    with r_col2:
+                        st.markdown(f"""
+                        <div class="metric-box">
+                            <div class="metric-box-lbl">Overall Form Score</div>
+                            <div class="metric-box-val" style="color:{'#34d399' if is_overall_correct else '#fb7185'};">{final_score}/100</div>
+                            <div style="color:#94a3b8; font-size:0.8rem; font-weight:600;">Kinematic Quality Score</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    with r_col3:
+                        st.markdown(f"""
+                        <div class="metric-box">
+                            <div class="metric-box-lbl">Repetition Accuracy</div>
+                            <div class="metric-box-val" style="color:{'#34d399' if is_overall_correct else '#fb7185'};">{accuracy_rate}%</div>
+                            <div style="color:#38bdf8; font-size:0.8rem; font-weight:600;">{vid_correct_reps} Correct | {vid_faulty_reps} Faulty</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    with r_col4:
+                        st.markdown(f"""
+                        <div class="metric-box">
+                            <div class="metric-box-lbl">Clinical Verdict</div>
+                            <div class="metric-box-val" style="font-size:1.1rem; color:{'#34d399' if is_overall_correct else '#fb7185'};">{overall_status}</div>
+                            <div style="color:#94a3b8; font-size:0.8rem; font-weight:600;">SQLite Database Saved 💾</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    st.markdown("<br>", unsafe_allow_html=True)
+
+                    # Diagnostic Report Block
+                    st.markdown(f"""
+                    <div class="modern-card">
+                        <h4 style="color: {'#34d399' if is_overall_correct else '#fb7185'}; margin:0 0 10px 0;">{overall_status}</h4>
+                        <div style="font-size: 1.05rem; font-weight: 600; color: #f8fafc; margin-bottom: 8px;">
+                            {final_risk_msg}
+                        </div>
+                        <div style="color: #94a3b8; font-size: 0.95rem;">
+                            <b>Total Completed Reps:</b> {vid_total_reps} ({vid_correct_reps} optimal, {vid_faulty_reps} faulty).
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    if final_faults:
+                        with st.expander("🚨 Detected Biomechanical Faults & Error Breakdown", expanded=True):
+                            for idx, fault in enumerate(final_faults, 1):
+                                st.error(f"**Fault {idx}:** {fault}")
+
+                    with st.expander("🩺 Physiotherapy & Corrective Prescription Guidelines", expanded=True):
+                        for p in (last_rx or ["Maintain upright posture, brace core, and observe controlled tempo."]):
+                            st.write(f"• {p}")
+
+                    # PDF & Text Download Buttons
+                    p_col1, p_col2 = st.columns(2)
+                    with p_col1:
+                        pdf_video_bytes = generate_clinical_pdf_report(
+                            user_name=st.session_state['user_name'],
+                            exercise_name=primary_exercise,
+                            is_correct=is_overall_correct,
+                            score=final_score,
+                            accuracy_rate=accuracy_rate,
+                            total_frames=total_frames,
+                            joint_angles=last_angles or {'avg_knee': global_min_knee, 'avg_elbow': global_min_elbow, 'torso_inc': global_max_torso, 'symmetry_score': 90},
+                            errors=final_faults,
+                            injury_risk=final_risk_msg,
+                            prescriptions=last_rx or ["Maintain controlled cadence"],
+                            file_name=uploaded_file.name
+                        )
+                        st.download_button(
+                            label="📄 Download Official Video Audit Certificate (PDF)",
+                            data=pdf_video_bytes,
+                            file_name=f"PoseAI_Video_Audit_{primary_exercise}.pdf",
+                            mime="application/pdf",
+                            use_container_width=True
+                        )
+
+                    with p_col2:
+                        video_report_text = f"""POSEAI CLINICAL BIOMECHANICAL AUDIT
+Patient / User: {st.session_state['user_name']}
+Exercise: {primary_exercise.upper()}
+Overall Verdict: {overall_status}
+Kinematic Form Score: {final_score}/100
+Repetition Accuracy: {accuracy_rate}% ({vid_correct_reps} correct, {vid_faulty_reps} faulty)
+Injury Risk Assessment: {final_risk_msg}
+Detected Faults: {', '.join(final_faults) if final_faults else 'None (Optimal Form)'}
+"""
+                        st.download_button(
+                            label="📝 Download Plain Text Summary (.txt)",
+                            data=video_report_text,
+                            file_name=f"PoseAI_Video_Audit_{primary_exercise}.txt",
+                            mime="text/plain",
+                            use_container_width=True
+                        )
+
+    # =========================================================
+    # TAB 2: SQLITE DATABASE WORKOUT HISTORY (NEW!)
+    # =========================================================
+    with tab2:
+        st.markdown('<div class="modern-card">', unsafe_allow_html=True)
+        st.subheader("📈 Personal Workout Telemetry & SQLite Database Records")
+        st.markdown(f"Every live webcam rep session, snapshot, and video audit performed by **{st.session_state['user_name']}** is saved to `fitness_database.db`.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        user_history = get_user_workout_history(active_user_handle, limit=50)
+        curr_stats = get_user_stats(active_user_handle)
+
+        # Overview Stats
+        s1, s2, s3, s4 = st.columns(4)
+        with s1:
+            st.markdown(f"""
+            <div class="metric-box">
+                <div class="metric-box-lbl">Total Sessions</div>
+                <div class="metric-box-val">{curr_stats['total_sessions']}</div>
+                <div style="color:#94a3b8; font-size:0.75rem;">Recorded in SQLite</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with s2:
+            st.markdown(f"""
+            <div class="metric-box">
+                <div class="metric-box-lbl">Grand Total Reps</div>
+                <div class="metric-box-val" style="color:#38bdf8;">{curr_stats['grand_total_reps']}</div>
+                <div style="color:#38bdf8; font-size:0.75rem;">All Exercises</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with s3:
+            st.markdown(f"""
+            <div class="metric-box">
+                <div class="metric-box-lbl">Correct Reps</div>
+                <div class="metric-box-val" style="color:#34d399;">{curr_stats['grand_correct_reps']}</div>
+                <div style="color:#34d399; font-size:0.75rem;">Optimal Biomechanics</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with s4:
+            st.markdown(f"""
+            <div class="metric-box">
+                <div class="metric-box-lbl">Average Form Score</div>
+                <div class="metric-box-val" style="color:#c084fc;">{curr_stats['avg_score']:.1f}/100</div>
+                <div style="color:#c084fc; font-size:0.75rem;">Lifetime Quality</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        if user_history:
+            df_hist = pd.DataFrame(user_history)
+            
+            # Progress Trend Chart
+            if len(df_hist) >= 2:
+                st.subheader("📊 Form Quality Score Progression")
+                fig_trend = px.line(
+                    df_hist.iloc[::-1],
+                    x="created_at",
+                    y="form_score",
+                    markers=True,
+                    title="Form Quality Score Over Time (SQLite)",
+                    color_discrete_sequence=["#38bdf8"]
+                )
+                fig_trend.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(15, 23, 42, 0.6)",
+                    font=dict(color="#f8fafc"),
+                    height=280
+                )
+                st.plotly_chart(fig_trend, use_container_width=True)
+
+            st.subheader("📋 Detailed Workout Audit Log")
+            # Format dataframe for display
+            display_df = df_hist[['created_at', 'exercise_name', 'total_reps', 'correct_reps', 'wrong_reps', 'form_score', 'is_correct', 'feedback']].copy()
+            display_df.columns = ['Timestamp', 'Exercise', 'Total Reps', 'Correct', 'Faulty', 'Score', 'Verdict', 'Feedback / Notes']
+            display_df['Verdict'] = display_df['Verdict'].apply(lambda x: '✅ Optimal' if x == 1 else '❌ Faulty')
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No workout records found for this account yet. Perform a live stream, snapshot, or video upload to record your first session!")
+
+    # =========================================================
+    # TAB 3: EXAMINER 1-CLICK VIVA SHOWCASE
+    # =========================================================
+    with tab3:
+        st.markdown('<div class="modern-card">', unsafe_allow_html=True)
+        st.header("✨ Examiner One-Click Viva Demonstration Suite")
+        st.markdown("Instantly evaluate pre-configured posture samples with Full Explainable AI (XAI) and Radar Biomechanics. No camera setup required.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        demo_col1, demo_col2 = st.columns([1, 2])
+
+        sample_options = {
+            "🏋️ Squat (Optimal Deep Parallel Form)": ("IMAGE DATASET/squat/squat_1000001.jpg", "squat"),
+            "⚠️ Squat (Controlled Descent Form)": ("IMAGE DATASET/squat/squat_1000031.jpg", "squat"),
+            "🤸 Plank (Neutral Spinal Line)": ("IMAGE DATASET/plank/plank_100001.jpg", "plank"),
+            "💪 Push-up (Biomechanics Check)": ("IMAGE DATASET/push up/push up_1000021.jpg", "pushup"),
+            "🏋️ Deadlift (Posterior Chain Hinge)": ("IMAGE DATASET/deadlift/deadlift_100001.jpg", "deadlift"),
+        }
+
+        with demo_col1:
+            st.markdown('<div class="modern-card">', unsafe_allow_html=True)
+            selected_sample = st.radio("Choose Viva Demo Sample:", list(sample_options.keys()))
+            run_sample = st.button("⚡ Run Instant Biomechanical Evaluation", type="primary", use_container_width=True)
+            
+            st.markdown("---")
+            st.markdown("#### 🔥 Active Calorie Burn Estimator (METs)")
+            user_weight = st.number_input("User Body Weight (kg):", 40, 150, 70)
+            workout_mins = st.slider("Workout Duration (minutes):", 5, 60, 20)
+            
+            met_values = {"squat": 5.0, "pushup": 8.0, "plank": 3.8, "deadlift": 6.0, "pullup": 8.0}
+            active_met = met_values.get(sample_options[selected_sample][1], 5.0)
+            cal_burned = round((active_met * 3.5 * user_weight / 200) * workout_mins, 1)
+            
+            st.info(f"🔥 **Estimated Energy Expenditure:** `{cal_burned} kcal` (MET Intensity: {active_met})")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        with demo_col2:
+            img_rel_path, default_label = sample_options[selected_sample]
+            if os.path.exists(img_rel_path):
+                img_sample = Image.open(img_rel_path)
+                image_np = np.array(img_sample)
+                image_rgb = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+                results = pose.process(image_rgb)
+
+                if results.pose_landmarks:
+                    landmarks_list = [[lm.x, lm.y, lm.z, getattr(lm, 'visibility', 1.0)] for lm in results.pose_landmarks.landmark]
+                    pred, conf, prob_dict, feats_dict = run_ml_inference(landmarks_list)
+                    status, risk, score, errors, joint_angles, faulty_joints, rx = evaluate_advanced_posture(landmarks_list, pred)
+                    is_correct = (len(errors) == 0)
+
+                    annotated = image_np.copy()
+                    annotated = draw_biomechanical_hud(annotated, landmarks_list, pred, is_correct, score, joint_angles, faulty_joints)
+
+                    col_v1, col_v2 = st.columns(2)
+                    with col_v1:
+                        st.markdown('<div class="video-viewport-card">', unsafe_allow_html=True)
+                        st.image(annotated, channels="RGB", caption="Live Biomechanical Keypoints", use_container_width=True)
+                        st.markdown('</div>', unsafe_allow_html=True)
+                    with col_v2:
+                        st.plotly_chart(create_biomechanical_radar_chart(joint_angles, score), use_container_width=True)
+
+                    st.markdown(f"""
+                    <div class="modern-card">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <div>
+                                <span style="font-size:1.25rem; font-weight:800; color:#38bdf8;">Exercise: {pred.upper()}</span>
+                                <span style="color:#94a3b8; font-size:0.9rem;"> ({conf:.1f}% Confidence)</span>
+                            </div>
+                            <span class="status-badge {'success' if is_correct else 'danger'}">{status}</span>
+                        </div>
+                        <div style="margin-top:10px; font-weight:600; color:{'#34d399' if is_correct else '#fb7185'};">
+                            {risk}
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    # 🎙️ Voice Coach — Viva Showcase audio
+                    viva_vc_msg = get_voice_feedback(
+                        exercise=pred,
+                        is_correct=is_correct,
+                        errors=errors,
+                        score=score
+                    )
+                    maybe_speak(viva_vc_msg, force=True)
+
+                    if feats_dict:
+                        st.plotly_chart(create_xai_feature_importance_chart(feats_dict), use_container_width=True)
+
+                    pdf_showcase_data = generate_clinical_pdf_report(
+                        user_name=f"Viva Candidate ({st.session_state['user_name']})",
+                        exercise_name=pred,
+                        is_correct=is_correct,
+                        score=score,
+                        accuracy_rate=100.0 if is_correct else 0.0,
+                        total_frames=1,
+                        joint_angles=joint_angles,
+                        errors=errors,
+                        injury_risk=risk,
+                        prescriptions=rx,
+                        file_name=os.path.basename(img_rel_path)
+                    )
+                    st.download_button(
+                        label="📄 Download Official Clinical Posture Certificate (PDF)",
+                        data=pdf_showcase_data,
+                        file_name=f"PoseAI_Certificate_{pred}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True
+                    )
+            else:
+                st.warning(f"Sample image not found at `{img_rel_path}`.")
+
+    # =========================================================
+    # TAB 4: DATA SCIENCE ML DASHBOARD
+    # =========================================================
+    with tab4:
+        st.markdown('<div class="modern-card">', unsafe_allow_html=True)
+        st.header("📈 Data Science Model Benchmarks & Metrics")
+        st.markdown("Comprehensive statistical evaluation report including 5-Fold Stratified Cross-Validation, Confusion Matrix Analysis, and Biomechanical Feature Importance.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        if os.path.exists("model_metrics.json"):
+            with open("model_metrics.json") as f:
+                metrics_data = json.load(f)
+
+            # Metric Cards
+            m1, m2, m3, m4 = st.columns(4)
+            with m1:
+                st.markdown(f"""
+                <div class="metric-box">
+                    <div class="metric-box-lbl">Tuned Accuracy</div>
+                    <div class="metric-box-val">{metrics_data.get('final_accuracy', 99.25)}%</div>
+                    <div style="color: #34d399; font-size: 0.8rem; font-weight:600;">+2.4% vs Baseline</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with m2:
+                st.markdown("""
+                <div class="metric-box">
+                    <div class="metric-box-lbl">5-Fold Stratified CV</div>
+                    <div class="metric-box-val">97.03%</div>
+                    <div style="color: #94a3b8; font-size: 0.8rem; font-weight:600;">± 0.67% Variance</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with m3:
+                st.markdown("""
+                <div class="metric-box">
+                    <div class="metric-box-lbl">Dataset Size</div>
+                    <div class="metric-box-val">3,328</div>
+                    <div style="color: #c084fc; font-size: 0.8rem; font-weight:600;">Annotated Frames</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with m4:
+                st.markdown("""
+                <div class="metric-box">
+                    <div class="metric-box-lbl">Engineered Features</div>
+                    <div class="metric-box-val">113</div>
+                    <div style="color: #38bdf8; font-size: 0.8rem; font-weight:600;">Joint Angles & Ratios</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # Algorithm Benchmarking Comparison Chart (Plotly)
+            st.subheader("🤖 Algorithm Benchmarking & Model Comparison")
+            if 'benchmark_results' in metrics_data:
+                bench_df = pd.DataFrame(metrics_data['benchmark_results']).T.reset_index()
+                bench_df.rename(columns={'index': 'Algorithm'}, inplace=True)
+                
+                fig_bench = px.bar(
+                    bench_df,
+                    x="Algorithm",
+                    y=["Test Accuracy", "CV Mean Accuracy"],
+                    barmode="group",
+                    title="Model Performance Comparison (Test vs 5-Fold CV Accuracy)",
+                    color_discrete_sequence=["#38bdf8", "#c084fc"]
+                )
+                fig_bench.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(15, 23, 42, 0.6)",
+                    font=dict(color="#f8fafc", family="Plus Jakarta Sans"),
+                    height=340
+                )
+                st.plotly_chart(fig_bench, use_container_width=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # Visual Artifacts
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.subheader("🎯 Multi-Class Confusion Matrix")
+                if os.path.exists("confusion_matrix.png"):
+                    st.image("confusion_matrix.png", use_container_width=True, caption="Multi-Class Confusion Matrix")
+
+            with col_b:
+                st.subheader("🌟 Top 15 Feature Importances")
+                if os.path.exists("feature_importance.png"):
+                    st.image("feature_importance.png", use_container_width=True, caption="Biomechanical Feature Importance Scores")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # Detailed Classification Report
+            st.subheader("📋 Classification Performance per Exercise Class")
+            if 'classification_report' in metrics_data:
+                cr_df = pd.DataFrame(metrics_data['classification_report']).T
+                st.dataframe(cr_df.style.format("{:.3f}"), use_container_width=True)

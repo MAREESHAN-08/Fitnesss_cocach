@@ -1,0 +1,18 @@
+{
+    "student": {
+        "name": "Data Science Student",
+        "password_hash": "adf574cc57f75a4bab36f461349a0da39858d82217e3ad249ab5962de6d23b04"
+    },
+    "admin": {
+        "name": "Project Admin",
+        "password_hash": "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9"
+    },
+    "ds": {
+        "name": "han",
+        "password_hash": "4627e00ddc49e55b22ba8420be6dd0b94607bec7c4ccdd9d20e37e252fefa776"
+    },
+    "jgtfg": {
+        "name": "dhlnl",
+        "password_hash": "8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92"
+    }
+}
